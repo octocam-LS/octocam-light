@@ -1,0 +1,4 @@
+# never publish WiFi credentials
+secrets.h
+*.bak
+build/
