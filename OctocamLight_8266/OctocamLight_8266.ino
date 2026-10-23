@@ -18,7 +18,14 @@
                                            it, or hold the remote's TX button 2.5-10 s)
                    hold 10 s +           : CLEAR all pairings
                  Decided on release; while held the OLED shows what a release would do.
+    D6 (GPIO12)  button to GND: each press = next brightness preset 25 -> 40 -> 60 -> 80 %
+                 -> 25 % (the next one above the current level; LED off -> on at 25 %)
     D2 (GPIO4) = SDA, D1 (GPIO5) = SCL : 0.91" 128x32 SSD1306 OLED
+    D4 (GPIO2)   PWM -> fan (4-pin fan PWM input, or a MOSFET for a 2-pin fan;
+                 see FAN_PWM_ACTIVE_HIGH). Same PWM frequency as the LED (PWM_FREQ_HZ;
+                 the ESP8266 has one frequency for all pins). D4 is a boot pin: it must not
+                 be pulled LOW at power-on (no pull-down on a MOSFET gate here). The D1
+                 mini's blue LED is on D4 too and glows with the fan.
 
   ---------------------------------------------------------------------------
   WHO SETS THE BRIGHTNESS
@@ -37,6 +44,23 @@
     whatever the state above -- also when the LED is off -- and back afterwards.
     Shooting at 100 % = no PWM at all (steady DC), so no banding with the electronic
     shutter. Below 100 % the LED is pulsed at PWM_FREQ_HZ: keep that high.
+    The shooting light comes on at once; when shooting stops it fades back down to
+    the normal level in BOOST_RAMP_DOWN_MS (100 ms). "Shooting Max" in the web app caps
+    the shooting light (default 100 %, saved).
+
+  ---------------------------------------------------------------------------
+  FAN (1.2)
+  ---------------------------------------------------------------------------
+  - Never below FAN_MIN_PCT (30 %) while the LED is on, FAN_OFF_PCT (20 %) while it
+    is off. 1 s at 100 % at power-on so a slow fan surely starts.
+  - Follows the normal LED level (button / dimmer / remote assist) directly:
+    fan % = LED %, and 100 % while that level is over FAN_FULL_ABOVE_PCT (70 %).
+  - Heat from shooting: once the LED has been above FAN_HEAT_LEVEL_PCT (25 %) for
+    more than FAN_HEAT_AFTER_MS (1 s) -- a long burst, a held SHOOT button -- the fan
+    ramps up slowly (FAN_RAMP_UP_PCT_S) towards what that light level needs (same
+    rule: level %, 100 % above 70 %). Short shots never get there. Dips shorter than
+    FAN_HEAT_GAP_MS don't restart the 1 s. Afterwards it ramps back down slowly
+    (FAN_RAMP_DOWN_PCT_S) to what the normal level needs.
 
   ---------------------------------------------------------------------------
   RADIO / PAIRING (receiver side, same as the Octocam triggers)
@@ -46,6 +70,9 @@
   "OctocamLight<last 3 MAC bytes>"), so the remote lists it in Paired Devices.
   An already-paired sender heard in the window is acked once more (re-ack).
   With nothing paired, the window opens by itself at power-on.
+  Web app "Paired Devices" (1.2.3, like the triggers): Pair (opens the window), Clear
+  Pairings (tap twice), one toggle per paired remote (blue = listened to) + Forget.
+  Names come from the remote's hello and are refreshed when it is heard again.
   Uses 0x06 REMOTE STATE from paired senders only:
     [7] flags (bit0 = shutter held, not used here) [8] base % (assist light)
     [9] boost % (shooting light) [10..11] boost ms left (big endian)
@@ -54,22 +81,19 @@
   ---------------------------------------------------------------------------
   WIFI / WEB APP / FIRMWARE UPDATE (1.1)
   ---------------------------------------------------------------------------
-  ESP-NOW (the remote) is on channel 11 and the ESP8266 has one radio, so the light is
-  normally NOT on the home WiFi. Hold D5 1-3 s to switch WiFi on:
-    - it joins the saved network (default SSID "birdbox"; the password is not in the
-      sketch -- see below). The OLED shows the IP address: open http://<that IP> on a
-      phone / PC in the same network.
-    - with no password saved yet, or if joining fails for 20 s, it opens its own setup
-      network "OctocamLight<hex>" (password 88888888) -> http://8.8.8.8 to enter
-      the WiFi name + password. They are saved in the light (not in the sketch, not on
-      GitHub) and kept through firmware updates.
-  The web app shows the light's state, lets you change the WiFi network and password,
-  and has "Check for Update" / "Install Update": the light downloads the newest .bin
-  from the GitHub repo (firmware/version.txt + firmware/OctocamLight_8266.bin) over
-  HTTPS and restarts with it.
-  While WiFi is on, the light can't hear the remote (other channel) -- the button and
-  the dimmer still work. WiFi switches off again (back to the remote) with D5 1-3 s,
-  "Back to Remote" in the app, or 90 s after the app was last used.
+  The light has its OWN network "OctocamLight<hex>" (password 88888888), web app at
+  http://192.168.0.1. It is on channel 11 like the remote, so the remote keeps working
+  while it is on. WIFI_ALWAYS_ON (default true): up from power-on, no timer.
+  D5 1-3 s switches it off / on (with WIFI_ALWAYS_ON false it starts off and goes off
+  again 90 s after the app was last used).
+  The web app shows the light's state, stores the HOME WiFi name + password (default
+  SSID "birdbox"; saved only in the light, not in the sketch or on GitHub, kept through
+  updates) and has ONE button "Update Firmware". Only then does the light join the home
+  WiFi: it leaves its own network (the phone loses it), joins (20 s timeout), reads
+  firmware/version.txt from the GitHub repo and, if that differs from FIRMWARE_VERSION,
+  downloads firmware/OctocamLight_8266.bin over HTTPS, installs it and restarts. Up to
+  date or failed: back to its own network; reconnect the phone and the app shows the
+  result. The OLED shows each step. The light never stays on the home WiFi.
 
   OLED: big brightness on the left ("OFF" when off). Right: who is in control and the
   number of paired senders; "SHOOT" while the shooting light is on; pairing as on the
@@ -91,7 +115,7 @@ extern "C" {
 }
 
 // ---------- USER-CONFIGURABLE SETTINGS ----------
-#define FIRMWARE_VERSION      "1.1.0-light8266"   // must match firmware/version.txt for a release
+#define FIRMWARE_VERSION      "1.2.3-light8266"  // must match firmware/version.txt for a release
 
 #define PRODUCT_SIGNATURE_0   0x8F
 #define PRODUCT_SIGNATURE_1   0x3C
@@ -120,11 +144,29 @@ extern "C" {
                                       // module gets warm or dims unevenly at low levels
 #define PWM_RANGE             1000
 #define BUTTON_PIN            14      // D5
+#define PRESET_PIN            12      // D6: preset button
 #define OLED_SDA              4       // D2
 #define OLED_SCL              5       // D1
+#define FAN_PIN               2       // D4 -> fan PWM (boot pin, see WIRING)
+#define FAN_PWM_ACTIVE_HIGH   true    // false if the fan runs faster while its input is LOW
+
+// ----- fan -----
+#define FAN_MIN_PCT           30      // never slower while the LED is on
+#define FAN_OFF_PCT           20      // never slower while the LED is off
+#define FAN_FULL_ABOVE_PCT    70      // LED level above this = fan 100 %
+#define FAN_HEAT_LEVEL_PCT    25      // LED above this ...
+#define FAN_HEAT_AFTER_MS     1000UL  // ... for longer than this = shooting heat, fan ramps up
+#define FAN_HEAT_GAP_MS       500UL   // shorter dips below FAN_HEAT_LEVEL_PCT don't restart the timer
+#define FAN_RAMP_UP_PCT_S     20      // shooting heat: 30 -> 100 % in 3.5 s
+#define FAN_RAMP_DOWN_PCT_S   5       // after shooting: 100 -> 30 % in 14 s
+#define FAN_KICK_MS           1000UL  // 100 % at power-on
+#define FAN_STEP_MS           50
 
 // ----- brightness -----
+#define BOOST_RAMP_DOWN_MS    100UL   // shooting light fades back to the normal level in this time
+#define SHOOT_MAX_DEFAULT     100     // % cap for the shooting light (web app setting "Shooting Max")
 #define START_LEVEL           25      // % at power-on (and when switched on with no level yet)
+const uint8_t PRESET_LEVELS[] = { 25, 40, 60, 80 };   // D6 button cycles through these
 #define POT_DEADZONE          40      // ADC counts (of 1023, ~4 %) the pot must move to take over
 #define POT_STEP_HYST         6       // ADC counts before a new level is taken while following the pot
 #define POT_READ_MS           20
@@ -133,10 +175,13 @@ extern "C" {
 #define POT_REVERSED          false   // true if turning "up" makes it darker
 
 // ----- WiFi / web app / update -----
-#define DEFAULT_WIFI_SSID     "birdbox"   // only the name; the password is entered in the setup network
-#define SETUP_AP_PASSWORD     "88888888"
+#define DEFAULT_WIFI_SSID     "birdbox"   // home WiFi for updates; only the name, the password is entered in the app
+#define AP_PASSWORD           "88888888"
+#define AP_IP                 192, 168, 0, 1   // the light's own network: web app at http://192.168.0.1
 #define WIFI_JOIN_TIMEOUT_MS  20000UL
-#define WIFI_IDLE_OFF_MS      90000UL     // back to the remote this long after the app was last used
+#define WIFI_IDLE_OFF_MS      90000UL     // only with WIFI_ALWAYS_ON false: own network off this long after the app was last used
+#define WIFI_ALWAYS_ON        true        // own network "OctocamLight<hex>" from power-on, no timer
+                                          // (same channel as the remote, so the remote keeps working)
 #define UPDATE_BASE_URL       "https://raw.githubusercontent.com/octocam-LS/octocam-light/main/firmware/"
 #define UPDATE_VERSION_FILE   "version.txt"
 #define UPDATE_BIN_FILE       "OctocamLight_8266.bin"
@@ -151,6 +196,7 @@ extern "C" {
 // ---------------- Saved pairings (emulated EEPROM) ----------------
 #define SETTINGS_MAGIC 0x4C543831UL   // "LT81"
 #define WIFI_MAGIC 0x57493131UL       // "WI11": WiFi fields below are valid
+#define EXT_MAGIC  0x4C583132UL       // "LX12": names / active / shootMax below are valid
 struct PersistedSettings {
   uint32_t magic;
   uint8_t  count;
@@ -158,10 +204,16 @@ struct PersistedSettings {
   uint32_t wifiMagic;                 // 1.1: appended, so 1.0 pairings stay valid
   char     wifiSsid[33];
   char     wifiPass[65];
+  uint32_t extMagic;                  // 1.2.3: appended
+  uint8_t  active;                    // bit i = paired sender i is on
+  char     names[MAX_PAIRED][SENDER_NAME_MAX + 1];
+  uint8_t  shootMax;                  // % cap for the shooting light
 };
 PersistedSettings settings;
 
 uint8_t pairedMacs[MAX_PAIRED][6];
+char pairedNames[MAX_PAIRED][SENDER_NAME_MAX + 1];
+uint8_t pairedActive = 0xFF;
 uint8_t pairedCount = 0;
 
 // ---------------- Light state ----------------
@@ -174,6 +226,16 @@ uint8_t boostLevel = 100;
 unsigned long boostUntil = 0;
 bool boostOn = false;
 int outputPct = -1;                   // what the PWM is set to now
+bool wasBoost = false;
+int rampFrom = -1;                    // > normal level: fading down after shooting
+unsigned long rampStartMs = 0;
+
+// fan
+int fanOutPct = -1;                   // what the fan PWM is set to now
+float fanHeatPct = FAN_OFF_PCT;       // slow part (shooting heat)
+unsigned long fanLastStep = 0;
+unsigned long hotSince = 0, lastHotMs = 0;
+bool hot = false;                     // LED above FAN_HEAT_LEVEL_PCT (with gap tolerance)
 
 // pot
 float potF = -1;
@@ -192,6 +254,7 @@ volatile unsigned long stateAtMs = 0;
 
 #define HELLO_QUEUE_LEN 4
 uint8_t helloMacs[HELLO_QUEUE_LEN][6];
+char helloNames[HELLO_QUEUE_LEN][SENDER_NAME_MAX + 1];
 volatile uint8_t helloHead = 0, helloTail = 0;
 
 bool pairingWindow = false;
@@ -204,32 +267,30 @@ char resultLine1[12] = "", resultLine2[12] = "", resultLine3[12] = "";
 // ---------------- Button ----------------
 bool btnDown = false;
 unsigned long btnEdgeMs = 0, btnPressMs = 0;
+bool presetDown = false;
+unsigned long presetEdgeMs = 0;
 
 // ---------------- Display ----------------
 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 char lastDrawKey[64] = "";
 
 // ---------------- WiFi / web app ----------------
-enum WifiMode { WM_OFF, WM_JOINING, WM_HOME, WM_SETUP };
+enum WifiMode { WM_OFF, WM_AP, WM_UPDATE };   // WM_UPDATE: on the home WiFi, only during an update
 WifiMode wifiMode = WM_OFF;
-unsigned long wifiStartMs = 0;
 unsigned long webLastUsed = 0;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
-IPAddress setupIP(8, 8, 8, 8);
-IPAddress setupMask(255, 255, 255, 0);
-volatile bool wifiReconnectRequested = false;   // new credentials saved: join again
-volatile bool wifiOffRequested = false;
-volatile bool updateCheckRequested = false;
-volatile bool updateInstallRequested = false;
-enum UpdState { UPD_IDLE, UPD_CHECKING, UPD_CHECKED, UPD_INSTALLING, UPD_ERROR };
+IPAddress apIP(AP_IP);
+IPAddress apMask(255, 255, 255, 0);
+bool updateRequested = false;
+enum UpdState { UPD_IDLE, UPD_JOINING, UPD_CHECKING, UPD_INSTALLING, UPD_UPTODATE, UPD_ERROR };
 UpdState updState = UPD_IDLE;
 String updRemoteVersion = "";
 String updError = "";
 int updProgress = 0;
 
-void startWifi();
-void stopWifi();
+void startAP();
+void stopAP();
 
 // =====================================================================
 // Helpers
@@ -245,9 +306,14 @@ void savePairings() {
   settings.count = pairedCount;
   memset(settings.macs, 0, sizeof(settings.macs));
   memcpy(settings.macs, pairedMacs, pairedCount * 6);
+  memset(settings.names, 0, sizeof(settings.names));
+  memcpy(settings.names, pairedNames, sizeof(settings.names));
+  settings.active = pairedActive;
   EEPROM.put(0, settings);
   EEPROM.commit();
 }
+
+bool senderActive(int i) { return i >= 0 && ((pairedActive >> i) & 1); }
 
 void loadPairings() {
   EEPROM.begin(sizeof(PersistedSettings));
@@ -269,6 +335,17 @@ void loadPairings() {
   }
   settings.wifiSsid[sizeof(settings.wifiSsid) - 1] = 0;
   settings.wifiPass[sizeof(settings.wifiPass) - 1] = 0;
+  if (settings.extMagic != EXT_MAGIC || settings.shootMax < 1 || settings.shootMax > 100) {
+    settings.extMagic = EXT_MAGIC;            // older save: all senders on, no names yet
+    settings.active = 0xFF;
+    memset(settings.names, 0, sizeof(settings.names));
+    settings.shootMax = SHOOT_MAX_DEFAULT;
+    EEPROM.put(0, settings);
+    EEPROM.commit();
+  }
+  for (uint8_t i = 0; i < MAX_PAIRED; i++) settings.names[i][SENDER_NAME_MAX] = 0;
+  memcpy(pairedNames, settings.names, sizeof(pairedNames));
+  pairedActive = settings.active;
 }
 
 void addPeer(uint8_t* mac) {
@@ -292,8 +369,67 @@ bool boostActive() {
   return boostOn && (long)(boostUntil - millis()) > 0;
 }
 
+void setFan(int pct) {
+  if (pct == fanOutPct) return;
+  fanOutPct = pct;
+  int duty = pct * PWM_RANGE / 100;
+  if (!FAN_PWM_ACTIVE_HIGH) duty = PWM_RANGE - duty;
+  if (duty <= 0)              { analogWrite(FAN_PIN, 0); digitalWrite(FAN_PIN, LOW); }
+  else if (duty >= PWM_RANGE) { analogWrite(FAN_PIN, 0); digitalWrite(FAN_PIN, HIGH); }
+  else                        analogWrite(FAN_PIN, duty);
+}
+
+// What the fan needs for an LED level: the same %, 100 % above FAN_FULL_ABOVE_PCT, never below the minimum.
+int fanForLevel(int pct) {
+  if (pct <= 0) return FAN_OFF_PCT;
+  if (pct > FAN_FULL_ABOVE_PCT) return 100;
+  return pct < FAN_MIN_PCT ? FAN_MIN_PCT : pct;
+}
+
+void updateFan(int normalPct) {
+  unsigned long now = millis();
+  if (now < FAN_KICK_MS) { setFan(100); return; }
+
+  if (outputPct > FAN_HEAT_LEVEL_PCT) {
+    if (!hot) { hot = true; hotSince = now; }
+    lastHotMs = now;
+  } else if (hot && now - lastHotMs > FAN_HEAT_GAP_MS) {
+    hot = false;
+  }
+
+  if (now - fanLastStep < FAN_STEP_MS) return;
+  float dt = (now - fanLastStep) / 1000.0f;
+  fanLastStep = now;
+
+  // slow part: ramps up towards the shooting level's need after 1 s of heat, then slowly back down
+  float heatTarget = (hot && now - hotSince > FAN_HEAT_AFTER_MS) ? fanForLevel(outputPct) : FAN_OFF_PCT;
+  if (heatTarget > fanHeatPct) fanHeatPct = min(heatTarget, fanHeatPct + FAN_RAMP_UP_PCT_S * dt);
+  else                         fanHeatPct = max(heatTarget, fanHeatPct - FAN_RAMP_DOWN_PCT_S * dt);
+
+  int pct = max(fanForLevel(normalPct), (int)lroundf(fanHeatPct));   // follows the normal level directly
+  setFan(pct);
+}
+
+// Shooting light on at once; when it ends, fade to the normal level in BOOST_RAMP_DOWN_MS.
 void updateOutput() {
-  setPwm(boostActive() ? boostLevel : (lightOn ? level : 0));
+  int normalPct = lightOn ? level : 0;
+  int pct = normalPct;
+  if (boostActive()) {
+    pct = boostLevel < settings.shootMax ? boostLevel : settings.shootMax;
+    wasBoost = true;
+    rampFrom = -1;
+  } else {
+    if (wasBoost) { wasBoost = false; rampFrom = outputPct; rampStartMs = millis(); }
+    if (rampFrom > normalPct) {
+      unsigned long t = millis() - rampStartMs;
+      if (t >= BOOST_RAMP_DOWN_MS) rampFrom = -1;
+      else pct = normalPct + (int)((long)(rampFrom - normalPct) * (long)(BOOST_RAMP_DOWN_MS - t) / (long)BOOST_RAMP_DOWN_MS);
+    } else {
+      rampFrom = -1;
+    }
+  }
+  setPwm(pct);
+  updateFan(normalPct);
 }
 
 // =====================================================================
@@ -306,15 +442,23 @@ void onDataRecv(uint8_t* mac, uint8_t* d, uint8_t len) {
   uint8_t type = d[4];
 
   if (type == PACKET_TYPE_PAIR_HELLO) {
-    if (!pairingWindow) return;
+    if (!pairingWindow && findPaired(mac) < 0) return;   // outside the window: only to refresh a name
     uint8_t next = (helloHead + 1) % HELLO_QUEUE_LEN;
     if (next == helloTail) return;
     memcpy(helloMacs[helloHead], mac, 6);
+    uint8_t n = 0;
+    if (len > PACKET_LEN) {
+      n = d[PACKET_LEN];
+      if (n > SENDER_NAME_MAX) n = SENDER_NAME_MAX;
+      if (n > len - PACKET_LEN - 1) n = len - PACKET_LEN - 1;
+      memcpy(helloNames[helloHead], d + PACKET_LEN + 1, n);
+    }
+    helloNames[helloHead][n] = 0;
     helloHead = next;
     return;
   }
   if (type == PACKET_TYPE_REMOTE_STATE && len >= REMOTE_STATE_LEN) {
-    if (findPaired(mac) < 0) return;
+    if (!senderActive(findPaired(mac))) return;      // not paired, or switched off in the app
     stateBase = d[8] > 100 ? 100 : d[8];
     stateBoost = d[9] > 100 ? 100 : d[9];
     stateLeftMs = ((uint16_t)d[10] << 8) | d[11];
@@ -374,12 +518,20 @@ void openPairingWindow() {
 void processPairing() {
   while (helloTail != helloHead) {
     uint8_t mac[6];
+    char name[SENDER_NAME_MAX + 1];
     memcpy(mac, helloMacs[helloTail], 6);
+    memcpy(name, helloNames[helloTail], sizeof(name));
     helloTail = (helloTail + 1) % HELLO_QUEUE_LEN;
-    if (!pairingWindow) continue;
     int idx = findPaired(mac);
+    if (idx >= 0 && name[0] && strcmp(pairedNames[idx], name) != 0) {   // a paired sender's name changed
+      strlcpy(pairedNames[idx], name, sizeof(pairedNames[idx]));
+      savePairings();
+    }
+    if (!pairingWindow) continue;
     if (idx < 0) {
       if (pairedCount >= MAX_PAIRED) continue;
+      strlcpy(pairedNames[pairedCount], name, sizeof(pairedNames[0]));
+      pairedActive |= (uint8_t)(1u << pairedCount);
       memcpy(pairedMacs[pairedCount++], mac, 6);
       pairingNew++;
       savePairings();
@@ -408,9 +560,27 @@ void clearPairings() {
     if (esp_now_is_peer_exist(pairedMacs[i]) > 0) esp_now_del_peer(pairedMacs[i]);
   }
   pairedCount = 0;
+  memset(pairedNames, 0, sizeof(pairedNames));
+  pairedActive = 0xFF;
   savePairings();
   pairingWindow = false;
   showResult("Pairings", "cleared", "");
+}
+
+// Forget one sender (one-sided, like the triggers): the rest moves up one place.
+void forgetSender(int idx) {
+  if (idx < 0 || idx >= pairedCount) return;
+  if (esp_now_is_peer_exist(pairedMacs[idx]) > 0) esp_now_del_peer(pairedMacs[idx]);
+  for (uint8_t i = idx; i + 1 < pairedCount; i++) {
+    memcpy(pairedMacs[i], pairedMacs[i + 1], 6);
+    memcpy(pairedNames[i], pairedNames[i + 1], sizeof(pairedNames[i]));
+  }
+  pairedCount--;
+  memset(pairedNames[pairedCount], 0, sizeof(pairedNames[0]));
+  uint8_t low = pairedActive & (uint8_t)((1u << idx) - 1);
+  uint8_t high = (uint8_t)(pairedActive >> (idx + 1)) << idx;
+  pairedActive = low | high | (uint8_t)(0xFF << pairedCount);   // free slots default to on
+  savePairings();
 }
 
 // =====================================================================
@@ -475,7 +645,7 @@ void checkButton() {
   } else if (held >= PAIR_PRESS_MS) {
     openPairingWindow();
   } else if (held >= WIFI_PRESS_MS) {
-    if (wifiMode == WM_OFF) startWifi(); else stopWifi();
+    if (wifiMode == WM_OFF) startAP(); else stopAP();
   } else {
     lightOn = !lightOn;                      // click: on / off
     if (lightOn && level == 0) level = START_LEVEL;
@@ -485,20 +655,39 @@ void checkButton() {
   }
 }
 
+// D6: on press, next preset above the current level (wraps to the first; LED off -> first).
+void checkPresetButton() {
+  unsigned long now = millis();
+  bool down = digitalRead(PRESET_PIN) == LOW;
+  if (down == presetDown || now - presetEdgeMs < BUTTON_DEBOUNCE_MS) return;
+  presetEdgeMs = now;
+  presetDown = down;
+  if (!down) return;
+  uint8_t next = PRESET_LEVELS[0];
+  if (lightOn) {
+    for (uint8_t i = 0; i < sizeof(PRESET_LEVELS); i++) {
+      if (PRESET_LEVELS[i] > level) { next = PRESET_LEVELS[i]; break; }
+    }
+  }
+  level = next;
+  lightOn = true;
+  source = SRC_BUTTON;
+  potControl = false;                        // the pot has to move again to take over
+  potRef = potF;
+}
+
 // =====================================================================
 // OLED
 // =====================================================================
-void drawWifiScreen(uint8_t tierShown);
-
 void updateDisplay() {
   unsigned long now = millis();
-  if (wifiMode != WM_OFF && holdTier() == 0) { drawWifiScreen(0); return; }
   char big[8];
   if (outputPct <= 0) strcpy(big, "OFF");
   else snprintf(big, sizeof(big), "%d%%", outputPct);
 
   char l1[12] = "", l2[12] = "", l3[12] = "";
   uint8_t tier = holdTier();
+  bool ipLine = false;
   if (tier == 1)      { strcpy(l1, "Release:"); strcpy(l2, wifiMode == WM_OFF ? "WiFi on" : "WiFi off"); }
   else if (tier == 2) { strcpy(l1, "Release:"); strcpy(l2, "Pairing"); }
   else if (tier == 3) { strcpy(l1, "Release:"); strcpy(l2, "Clear"); strcpy(l3, "pairings"); }
@@ -514,6 +703,7 @@ void updateDisplay() {
     strcpy(l1, boostActive() ? "SHOOT" : src[source]);
     if (pairedCount) snprintf(l2, sizeof(l2), "%u paired", pairedCount);
     else strcpy(l2, "no pair");
+    if (wifiMode == WM_AP) { strlcpy(l3, apIP.toString().c_str(), sizeof(l3)); ipLine = true; }
   }
 
   char key[48];
@@ -528,6 +718,7 @@ void updateDisplay() {
   u8g2.setFont(u8g2_font_6x10_tr);
   u8g2.drawStr(80, 9, l1);
   u8g2.drawStr(80, 20, l2);
+  if (ipLine) u8g2.setFont(u8g2_font_4x6_tr);   // "192.168.0.1" fits the 48 px column only in 4x6
   u8g2.drawStr(80, 31, l3);
   u8g2.sendBuffer();
 }
@@ -537,26 +728,20 @@ void updateDisplay() {
 // =====================================================================
 #include "lightpage.h"
 
-void drawWifiScreen(uint8_t) {
+void drawWifiScreen() {
   char l1[24], l2[24], l3[24];
   char lvl[8];
   if (outputPct <= 0) strcpy(lvl, "OFF"); else snprintf(lvl, sizeof(lvl), "%d%%", outputPct);
-  if (updState == UPD_INSTALLING) {
-    strcpy(l1, "Updating firmware");
-    snprintf(l2, sizeof(l2), "%d %%", updProgress);
-    strcpy(l3, "don't switch off");
-  } else if (wifiMode == WM_JOINING) {
-    snprintf(l1, sizeof(l1), "WiFi %.15s", settings.wifiSsid);
-    strcpy(l2, "connecting...");
+  strcpy(l1, "Firmware update");
+  if (updState == UPD_JOINING) {
+    snprintf(l2, sizeof(l2), "joining %.13s", settings.wifiSsid);
     snprintf(l3, sizeof(l3), "LED %s", lvl);
-  } else if (wifiMode == WM_HOME) {
-    snprintf(l1, sizeof(l1), "WiFi %.15s", settings.wifiSsid);
-    strlcpy(l2, WiFi.localIP().toString().c_str(), sizeof(l2));
-    snprintf(l3, sizeof(l3), "LED %s  D5 1-3s:off", lvl);
+  } else if (updState == UPD_CHECKING) {
+    strcpy(l2, "asking GitHub...");
+    snprintf(l3, sizeof(l3), "LED %s", lvl);
   } else {
-    strcpy(l1, "Setup: join WiFi");
-    strlcpy(l2, myName, sizeof(l2));
-    strcpy(l3, "pw 88888888  8.8.8.8");
+    snprintf(l2, sizeof(l2), "installing %d %%", updProgress);
+    strcpy(l3, "don't switch off");
   }
   char key[64];
   snprintf(key, sizeof(key), "W%s|%s|%s", l1, l2, l3);
@@ -570,35 +755,34 @@ void drawWifiScreen(uint8_t) {
   u8g2.sendBuffer();
 }
 
+// While the update blocks loop(): dimmer, D6 presets, LED, fan and the OLED keep going.
+void keepLightRunning() {
+  checkPresetButton();
+  readPot();
+  updateOutput();
+  drawWifiScreen();
+}
+
 void webUsed() { webLastUsed = millis(); }
 
-void startSetupAP() {
+// The light's own network on channel 11, so ESP-NOW (the remote) keeps working.
+void startAP() {
   WiFi.disconnect();
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(setupIP, setupIP, setupMask);
-  WiFi.softAP(myName, SETUP_AP_PASSWORD, WIFI_CHANNEL, 0, 1);
-  dnsServer.start(53, "*", setupIP);
+  WiFi.mode(WIFI_AP_STA);
+  wifi_station_disconnect();
+  WiFi.softAPConfig(apIP, apIP, apMask);
+  WiFi.softAP(myName, AP_PASSWORD, WIFI_CHANNEL, 0, 4);
+  dnsServer.start(53, "*", apIP);
   server.begin();
-  wifiMode = WM_SETUP;
+  wifiMode = WM_AP;
   webUsed();
+  lastDrawKey[0] = 0;
 }
 
-void startWifi() {
-  wifiStartMs = millis();
-  webUsed();
-  updState = UPD_IDLE;
-  if (settings.wifiPass[0] == 0 || settings.wifiSsid[0] == 0) { startSetupAP(); return; }
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(settings.wifiSsid, settings.wifiPass);
-  wifiMode = WM_JOINING;
-}
-
-// Back to the remote: home WiFi off, radio on channel 11 again.
-void stopWifi() {
+void stopAP() {
   server.stop();
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.disconnect();
   WiFi.mode(WIFI_STA);
   wifi_station_disconnect();
   wifi_set_channel(WIFI_CHANNEL);
@@ -621,33 +805,30 @@ String statusJson() {
   String j = "{\"version\":\"" FIRMWARE_VERSION "\"";
   j += ",\"name\":\"" + String(myName) + "\"";
   j += ",\"led\":" + String(outputPct < 0 ? 0 : outputPct);
+  j += ",\"fan\":" + String(fanOutPct < 0 ? 0 : fanOutPct);
   j += ",\"on\":" + String(lightOn ? "true" : "false");
   j += ",\"source\":\"" + String(sourceName()) + "\"";
   j += ",\"paired\":" + String(pairedCount);
-  j += ",\"mode\":\"" + String(wifiMode == WM_HOME ? "home" : "setup") + "\"";
+  j += ",\"shootMax\":" + String(settings.shootMax);
   j += ",\"ssid\":\"" + jsonEsc(settings.wifiSsid) + "\"";
   j += ",\"passSet\":" + String(settings.wifiPass[0] ? "true" : "false");
-  j += ",\"ip\":\"" + (wifiMode == WM_HOME ? WiFi.localIP().toString() : setupIP.toString()) + "\"";
-  const char* us[] = { "idle", "checking", "checked", "installing", "error" };
+  j += ",\"ip\":\"" + apIP.toString() + "\"";
+  const char* us[] = { "idle", "joining", "checking", "installing", "uptodate", "error" };
   j += ",\"upd\":\"" + String(us[updState]) + "\"";
   j += ",\"remoteVersion\":\"" + jsonEsc(updRemoteVersion.c_str()) + "\"";
   j += ",\"updError\":\"" + jsonEsc(updError.c_str()) + "\"";
-  j += ",\"progress\":" + String(updProgress);
-  j += ",\"idleOffS\":" + String((long)(WIFI_IDLE_OFF_MS - (millis() - webLastUsed)) / 1000) + "}";
+  j += ",\"progress\":" + String(updProgress) + "}";
   return j;
 }
 
 void handleRoot() { webUsed(); server.send_P(200, "text/html", PAGE_HTML); }
 void handleRedirect() {
-  server.sendHeader("Location", "http://" + setupIP.toString() + "/", true);
+  server.sendHeader("Location", "http://" + apIP.toString() + "/", true);
   server.send(302, "text/plain", "");
-}
-void handleNotFound() {
-  if (wifiMode == WM_SETUP) handleRedirect();      // captive portal in the setup network
-  else server.send(404, "text/plain", "not found");
 }
 void handleStatus() { webUsed(); server.send(200, "application/json", statusJson()); }
 
+// Home WiFi name + password: only saved here, used by the firmware update.
 void handleWifiSave() {
   webUsed();
   String ssid = server.arg("ssid"), pass = server.arg("pass");
@@ -657,54 +838,105 @@ void handleWifiSave() {
     return;
   }
   strlcpy(settings.wifiSsid, ssid.c_str(), sizeof(settings.wifiSsid));
-  strlcpy(settings.wifiPass, pass.c_str(), sizeof(settings.wifiPass));
+  if (pass.length()) strlcpy(settings.wifiPass, pass.c_str(), sizeof(settings.wifiPass));
   EEPROM.put(0, settings);
   EEPROM.commit();
   server.send(200, "application/json", "{\"ok\":true}");
-  wifiReconnectRequested = true;                     // after the answer is out
 }
 
-void handleWifiOff() { server.send(200, "application/json", "{\"ok\":true}"); wifiOffRequested = true; }
-
-void handleCheckUpdate() {
-  webUsed();
-  if (wifiMode != WM_HOME) { server.send(200, "application/json", statusJson()); return; }
-  updState = UPD_CHECKING;
-  updateCheckRequested = true;
-  server.send(200, "application/json", statusJson());
+// ----- Paired Devices (same API as the triggers) -----
+String macStr(const uint8_t* m) {
+  char b[18];
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return String(b);
 }
 
-void handleInstallUpdate() {
+int pairedFromArg() {
+  String s = server.arg("mac");
+  uint8_t m[6];
+  if (sscanf(s.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) return -1;
+  return findPaired(m);
+}
+
+String sendersJson() {
+  long left = pairingWindow ? (long)(pairingEnd - millis()) : 0;
+  String j = "{\"pairing\":" + String(left > 0 ? (left + 999) / 1000 : 0) + ",\"senders\":[";
+  for (uint8_t i = 0; i < pairedCount; i++) {
+    if (i) j += ",";
+    j += "{\"mac\":\"" + macStr(pairedMacs[i]) + "\",\"name\":\"" + jsonEsc(pairedNames[i]) +
+         "\",\"active\":" + String(senderActive(i) ? "true" : "false") + "}";
+  }
+  return j + "]}";
+}
+
+void handleSenders() { webUsed(); server.send(200, "application/json", sendersJson()); }
+
+void handleSenderActive() {
   webUsed();
-  if (wifiMode == WM_HOME && updState != UPD_INSTALLING) {
-    updState = UPD_INSTALLING;
-    updProgress = 0;
-    updateInstallRequested = true;
+  int i = pairedFromArg();
+  if (i >= 0) {
+    if (server.arg("active") == "1") pairedActive |= (uint8_t)(1u << i);
+    else pairedActive &= (uint8_t)~(1u << i);
+    savePairings();
+  }
+  server.send(200, "application/json", sendersJson());
+}
+
+void handleSenderForget() {
+  webUsed();
+  forgetSender(pairedFromArg());
+  server.send(200, "application/json", sendersJson());
+}
+
+void handleClearPairings() { webUsed(); clearPairings(); server.send(200, "application/json", sendersJson()); }
+void handlePair() { webUsed(); openPairingWindow(); server.send(200, "application/json", sendersJson()); }
+
+void handleSettings() {
+  webUsed();
+  if (server.hasArg("shootMax")) {
+    int v = server.arg("shootMax").toInt();
+    settings.shootMax = (uint8_t)constrain(v, 1, 100);
+    EEPROM.put(0, settings);
+    EEPROM.commit();
   }
   server.send(200, "application/json", statusJson());
 }
 
-void doUpdateCheck() {
+void handleUpdate() {
+  webUsed();
+  if (settings.wifiPass[0] == 0 || settings.wifiSsid[0] == 0) {
+    updState = UPD_ERROR;
+    updError = "Save your WiFi name and password first.";
+  } else if (!updateRequested) {
+    updateRequested = true;                    // runs after the answer is out
+    updState = UPD_JOINING;
+    updError = "";
+  }
+  server.send(200, "application/json", statusJson());
+}
+
+bool doUpdateCheck() {
   BearSSL::WiFiClientSecure client;
   client.setInsecure();                 // GitHub over HTTPS; the image itself is checked by the updater
   client.setBufferSizes(16384, 512);
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setTimeout(8000);
-  updError = "";
-  if (!http.begin(client, UPDATE_BASE_URL UPDATE_VERSION_FILE)) { updState = UPD_ERROR; updError = "can't reach GitHub"; return; }
+  bool ok = false;
+  if (!http.begin(client, UPDATE_BASE_URL UPDATE_VERSION_FILE)) { updError = "can't reach GitHub"; return false; }
   int code = http.GET();
   if (code == 200) {
     updRemoteVersion = http.getString();
     updRemoteVersion.trim();
-    if (updRemoteVersion.length() == 0 || updRemoteVersion.length() > 40) { updState = UPD_ERROR; updError = "version.txt looks wrong"; }
-    else updState = UPD_CHECKED;
+    if (updRemoteVersion.length() == 0 || updRemoteVersion.length() > 40) updError = "version.txt on GitHub looks wrong";
+    else ok = true;
   } else if (code == 404) {
-    updState = UPD_ERROR; updError = "no firmware published on GitHub yet";
+    updError = "no firmware published on GitHub yet";
   } else {
-    updState = UPD_ERROR; updError = "GitHub answered " + String(code) + " " + http.errorToString(code);
+    updError = "GitHub answered " + String(code) + " " + http.errorToString(code);
   }
   http.end();
+  return ok;
 }
 
 void doUpdateInstall() {
@@ -715,49 +947,59 @@ void doUpdateInstall() {
   ESPhttpUpdate.rebootOnUpdate(true);
   ESPhttpUpdate.onProgress([](int done, int total) {
     int p = total > 0 ? (int)((long long)done * 100 / total) : 0;
-    if (p != updProgress) { updProgress = p; drawWifiScreen(0); }
+    if (p != updProgress) { updProgress = p; keepLightRunning(); }
   });
-  updProgress = 0;
-  drawWifiScreen(0);
   t_httpUpdate_return r = ESPhttpUpdate.update(client, UPDATE_BASE_URL UPDATE_BIN_FILE);
   // only gets here if it failed (success restarts the light)
-  updState = UPD_ERROR;
   updError = (r == HTTP_UPDATE_NO_UPDATES) ? String("no update") : ESPhttpUpdate.getLastErrorString();
-  lastDrawKey[0] = 0;
+}
+
+// "Update Firmware" in the app: leave the own network, join the home WiFi, check GitHub,
+// install if the version differs (restarts), otherwise come back to the own network.
+void runUpdate() {
+  delay(300);                                  // let the answer reach the phone
+  server.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  wifiMode = WM_UPDATE;
+  updState = UPD_JOINING;
+  updProgress = 0;
+  updRemoteVersion = "";
+  updError = "";
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(settings.wifiSsid, settings.wifiPass);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_JOIN_TIMEOUT_MS) { keepLightRunning(); delay(20); }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    updState = UPD_ERROR;
+    updError = "Couldn't join " + String(settings.wifiSsid) + " (wrong password or out of range?)";
+  } else {
+    updState = UPD_CHECKING;
+    keepLightRunning();
+    if (!doUpdateCheck()) updState = UPD_ERROR;
+    else if (updRemoteVersion == FIRMWARE_VERSION) updState = UPD_UPTODATE;
+    else {
+      updState = UPD_INSTALLING;
+      keepLightRunning();
+      doUpdateInstall();                       // restarts the light on success
+      updState = UPD_ERROR;
+    }
+  }
+  WiFi.disconnect();
+  wifi_station_disconnect();
+  startAP();                                   // back to the own network, the remote works again
+  if (updState == UPD_UPTODATE) showResult("Up to", "date", "");
+  else showResult("Update", "failed", "see app");
 }
 
 void serviceWifi() {
-  if (wifiMode == WM_OFF) return;
-  unsigned long now = millis();
-  if (wifiMode == WM_JOINING) {
-    if (WiFi.status() == WL_CONNECTED) {
-      server.begin();
-      wifiMode = WM_HOME;
-      webUsed();
-    } else if (now - wifiStartMs >= WIFI_JOIN_TIMEOUT_MS) {
-      startSetupAP();                          // wrong password / network not here
-    }
-    return;
-  }
-  if (wifiMode == WM_SETUP) {
-    dnsServer.processNextRequest();
-    if (WiFi.softAPgetStationNum() > 0) webUsed();
-  }
+  if (wifiMode != WM_AP) return;
+  dnsServer.processNextRequest();
+  if (WiFi.softAPgetStationNum() > 0) webUsed();
   server.handleClient();
-
-  if (wifiReconnectRequested) {
-    wifiReconnectRequested = false;
-    delay(300);                                // let the answer reach the phone
-    server.stop();
-    dnsServer.stop();
-    WiFi.softAPdisconnect(true);
-    startWifi();
-    return;
-  }
-  if (wifiOffRequested) { wifiOffRequested = false; delay(200); stopWifi(); return; }
-  if (updateCheckRequested) { updateCheckRequested = false; doUpdateCheck(); webUsed(); }
-  if (updateInstallRequested) { updateInstallRequested = false; doUpdateInstall(); webUsed(); }
-  if (now - webLastUsed >= WIFI_IDLE_OFF_MS) stopWifi();
+  if (updateRequested) { updateRequested = false; runUpdate(); return; }
+  if (!WIFI_ALWAYS_ON && millis() - webLastUsed >= WIFI_IDLE_OFF_MS) stopAP();
 }
 
 // =====================================================================
@@ -768,7 +1010,10 @@ void setup() {
   digitalWrite(PWM_PIN, PWM_ACTIVE_HIGH ? LOW : HIGH);
   analogWriteRange(PWM_RANGE);
   analogWriteFreq(PWM_FREQ_HZ);
+  pinMode(FAN_PIN, OUTPUT);
+  setFan(100);                               // start kick, see FAN_KICK_MS
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PRESET_PIN, INPUT_PULLUP);
 
   Wire.begin(OLED_SDA, OLED_SCL);
   u8g2.begin();
@@ -806,11 +1051,16 @@ void setup() {
   server.on("/connecttest.txt", handleRedirect);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/wifi", HTTP_POST, handleWifiSave);
-  server.on("/api/wifi-off", HTTP_POST, handleWifiOff);
-  server.on("/api/check-update", HTTP_POST, handleCheckUpdate);
-  server.on("/api/install-update", HTTP_POST, handleInstallUpdate);
-  server.onNotFound(handleNotFound);
+  server.on("/api/update", HTTP_POST, handleUpdate);
+  server.on("/api/settings", HTTP_POST, handleSettings);
+  server.on("/api/senders", HTTP_GET, handleSenders);
+  server.on("/api/sender-active", HTTP_POST, handleSenderActive);
+  server.on("/api/sender-forget", HTTP_POST, handleSenderForget);
+  server.on("/api/clear-pairings", HTTP_POST, handleClearPairings);
+  server.on("/api/pair", HTTP_POST, handlePair);
+  server.onNotFound(handleRedirect);           // captive portal: everything else -> the app
 
+  if (WIFI_ALWAYS_ON) startAP();
   if (pairedCount == 0) openPairingWindow(); // nothing paired yet: ready to pair at once
   updateDisplay();
 }
@@ -819,6 +1069,7 @@ void loop() {
   applyRemoteState();        // first: shooting light must not wait
   updateOutput();
   checkButton();
+  checkPresetButton();
   readPot();
   processPairing();
   updateOutput();

@@ -1,16 +1,18 @@
 # Octocam Light
 
 LED light unit for the Octocam Remote: Wemos D1 mini (ESP8266), MOSFET dimmer on D7,
-dimmer pot on A0, button on D5, 0.91" 128x32 OLED on D2/D1. Listens to the remote over
-ESP-NOW (channel 11); details are at the top of the sketch.
+fan PWM on D4, dimmer pot on A0, buttons on D5 and D6 (presets), 0.91" 128x32 OLED on
+D2/D1. Listens to the remote over ESP-NOW (channel 11); details are at the top of the sketch.
 
 ## Updating a light over WiFi
 
-1. On the light, hold D5 for 1-3 s: WiFi on. The OLED shows its IP address
-   (first time: it opens the setup network `OctocamLight<hex>`, password `88888888`,
-   page http://8.8.8.8 -- enter the WiFi name and password there).
-2. Open `http://<IP>` in the same network, tap **Check for Update**, then **Install Update**.
-3. The light downloads `firmware/OctocamLight_8266.bin` from this repo and restarts.
+1. Join the light's own network `OctocamLight<hex>` (password `88888888`) and open
+   http://192.168.0.1.
+2. First time only: enter your home WiFi name and password under "Home WiFi (for updates)".
+3. Tap **Update Firmware**. The light leaves its network, joins your WiFi, reads
+   `firmware/version.txt` here and, if it differs from the installed version, installs
+   `firmware/OctocamLight_8266.bin` and restarts. Then it is back on its own network:
+   reconnect and the page shows the result.
 
 The WiFi password is stored only in the light. It is never in the sketch, a .bin or this repo.
 
