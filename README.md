@@ -6,8 +6,8 @@ D2/D1. Listens to the remote over ESP-NOW (channel 11); details are at the top o
 
 ## Updating a light over WiFi
 
-1. Join the light's own network `OctocamLight<hex>` (password `88888888`) and open
-   http://192.168.0.1.
+1. Join the light's own network `OctocamLight<hex>` (password `88888888` unless changed) and open
+   http://8.8.8.8 (or tap the phone's "sign in to network" notice).
 2. First time only: enter your home WiFi name and password under "Home WiFi (for updates)".
 3. Tap **Update Firmware**. The light leaves its network, joins your WiFi, reads
    `firmware/version.txt` here and, if it differs from the installed version, installs

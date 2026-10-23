@@ -45,8 +45,10 @@
     Shooting at 100 % = no PWM at all (steady DC), so no banding with the electronic
     shutter. Below 100 % the LED is pulsed at PWM_FREQ_HZ: keep that high.
     The shooting light comes on at once; when shooting stops it fades back down to
-    the normal level in BOOST_RAMP_DOWN_MS (100 ms). "Shooting Max" in the web app caps
-    the shooting light (default 100 %, saved).
+    the normal level in BOOST_RAMP_DOWN_MS (100 ms).
+    SHOOTING MAX = the shooting light's level (default 100 %, saved). Set by the remote
+    (its per-light setting arrives as 0x06 [9]; a CHANGED value takes over, like the
+    assist level) or in this web app (then 0x07 LIGHT_INFO tells the remotes).
 
   ---------------------------------------------------------------------------
   FAN (1.2)
@@ -73,19 +75,31 @@
   Web app "Paired Devices" (1.2.3, like the triggers): Pair (opens the window), Clear
   Pairings (tap twice), one toggle per paired remote (blue = listened to) + Forget.
   Names come from the remote's hello and are refreshed when it is heard again.
-  Uses 0x06 REMOTE STATE from paired senders only:
-    [7] flags (bit0 = shutter held, not used here) [8] base % (assist light)
-    [9] boost % (shooting light) [10..11] boost ms left (big endian)
+  Uses 0x06 REMOTE STATE from paired senders that are on only:
+    [7] flags (bit0 = shutter held, not used here) [8] base % (assist / AF light)
+    [9] Shooting Max % for this light [10..11] boost ms left (big endian)
   Everything else (0x01 TRIGGER ...) is ignored.
+  Sends 0x07 LIGHT_INFO (1.2.4, 9 bytes) to its paired remotes: [7] Shooting Max %,
+  [8] flags bit0 = changed in this web app. After pairing, at power-on, when Shooting Max
+  is changed here, and as an answer to a remote's state at most every 10 s. Remote
+  1.2.0+ lists the light with its own row (on/off, AF, TEST, max) from this.
+  ESP-NOW goes out on the station interface, which keeps the chip's original soft-AP MAC
+  (the address remotes paired with); the own network gets a neighbouring MAC. So the
+  remote keeps reaching the light with the own network switched off.
 
   ---------------------------------------------------------------------------
   WIFI / WEB APP / FIRMWARE UPDATE (1.1)
   ---------------------------------------------------------------------------
-  The light has its OWN network "OctocamLight<hex>" (password 88888888), web app at
-  http://192.168.0.1. It is on channel 11 like the remote, so the remote keeps working
-  while it is on. WIFI_ALWAYS_ON (default true): up from power-on, no timer.
-  D5 1-3 s switches it off / on (with WIFI_ALWAYS_ON false it starts off and goes off
-  again 90 s after the app was last used).
+  The light has its OWN network "OctocamLight<hex>" (password 88888888 until changed),
+  web app at http://8.8.8.8 (phones then show their "sign in to network" notice). It is
+  on channel 11 like the remote, so the remote keeps working while it is on.
+  WIFI_ALWAYS_ON (default true): up from power-on, no timer. "Kill WiFi" in the app or
+  D5 1-3 s switches it off; D5 1-3 s again (or power off/on) brings it back. With
+  WIFI_ALWAYS_ON false it starts off and goes off again 90 s after the app was last used.
+  Network name and password can be changed in the app, like on the senders: a new
+  password goes live once no phone is connected; 8+ characters, empty = open network;
+  the network is always open for the first 10 s after power-on (forgotten password).
+  A new name restarts the network at once (reconnect to it).
   The web app shows the light's state, stores the HOME WiFi name + password (default
   SSID "birdbox"; saved only in the light, not in the sketch or on GitHub, kept through
   updates) and has ONE button "Update Firmware". Only then does the light join the home
@@ -115,7 +129,7 @@ extern "C" {
 }
 
 // ---------- USER-CONFIGURABLE SETTINGS ----------
-#define FIRMWARE_VERSION      "1.2.3-light8266"  // must match firmware/version.txt for a release
+#define FIRMWARE_VERSION      "1.2.4-light8266"  // must match firmware/version.txt for a release
 
 #define PRODUCT_SIGNATURE_0   0x8F
 #define PRODUCT_SIGNATURE_1   0x3C
@@ -125,8 +139,12 @@ extern "C" {
 #define PACKET_TYPE_PAIR_HELLO   0x04
 #define PACKET_TYPE_PAIR_INFO    0x05
 #define PACKET_TYPE_REMOTE_STATE 0x06
+#define PACKET_TYPE_LIGHT_INFO   0x07   // light -> remote: [7] Shooting Max %, [8] flags bit0 = changed here
 #define PACKET_LEN               7
 #define REMOTE_STATE_LEN         12
+#define LIGHT_INFO_LEN           9
+#define STATE_FLAG_LIGHT_MAX     0x02     // 0x06 [7]: [9] is our own Shooting Max, set on the remote (remote 1.2+)
+#define LIGHT_INFO_EVERY_MS      10000UL  // answer a remote's state with our info at most this often
 #define SENDER_NAME_MAX          32
 
 #define WIFI_CHANNEL          11
@@ -164,7 +182,8 @@ extern "C" {
 
 // ----- brightness -----
 #define BOOST_RAMP_DOWN_MS    100UL   // shooting light fades back to the normal level in this time
-#define SHOOT_MAX_DEFAULT     100     // % cap for the shooting light (web app setting "Shooting Max")
+#define SHOOT_MAX_DEFAULT     100     // % of the shooting light (web app "Shooting Max", or set by the remote)
+#define SHOOT_MAX_MIN         5
 #define START_LEVEL           25      // % at power-on (and when switched on with no level yet)
 const uint8_t PRESET_LEVELS[] = { 25, 40, 60, 80 };   // D6 button cycles through these
 #define POT_DEADZONE          40      // ADC counts (of 1023, ~4 %) the pot must move to take over
@@ -176,8 +195,10 @@ const uint8_t PRESET_LEVELS[] = { 25, 40, 60, 80 };   // D6 button cycles throug
 
 // ----- WiFi / web app / update -----
 #define DEFAULT_WIFI_SSID     "birdbox"   // home WiFi for updates; only the name, the password is entered in the app
-#define AP_PASSWORD           "88888888"
-#define AP_IP                 192, 168, 0, 1   // the light's own network: web app at http://192.168.0.1
+#define DEFAULT_AP_PASSWORD   "88888888"   // until a password is saved in the app
+#define AP_IP                 8, 8, 8, 8   // the light's own network: web app at http://8.8.8.8 (phones show "sign in")
+#define PASSWORD_GRACE_MS     10000UL      // own network is open this long after power-on (forgotten password)
+#define AP_MAX_CLIENTS        4
 #define WIFI_JOIN_TIMEOUT_MS  20000UL
 #define WIFI_IDLE_OFF_MS      90000UL     // only with WIFI_ALWAYS_ON false: own network off this long after the app was last used
 #define WIFI_ALWAYS_ON        true        // own network "OctocamLight<hex>" from power-on, no timer
@@ -207,8 +228,13 @@ struct PersistedSettings {
   uint32_t extMagic;                  // 1.2.3: appended
   uint8_t  active;                    // bit i = paired sender i is on
   char     names[MAX_PAIRED][SENDER_NAME_MAX + 1];
-  uint8_t  shootMax;                  // % cap for the shooting light
+  uint8_t  shootMax;                  // % of the shooting light
+  uint32_t apMagic;                   // 1.2.4: appended
+  uint8_t  apPassSaved;               // 0 = never saved -> DEFAULT_AP_PASSWORD
+  char     apPass[65];                // empty (but saved) = open network
+  char     apSsid[33];                // empty = automatic "OctocamLight<hex>"
 };
+#define AP_MAGIC 0x4C573134UL         // "LW14": own-network name / password above are valid
 PersistedSettings settings;
 
 uint8_t pairedMacs[MAX_PAIRED][6];
@@ -222,6 +248,7 @@ Source source = SRC_START;
 bool lightOn = true;
 uint8_t level = START_LEVEL;          // % while on (not shooting)
 uint8_t lastRemoteBase = 0;           // the remote's assist level last seen (0 = off)
+uint8_t lastRemoteMax = 0;            // the remote's Shooting Max for us last seen (0 = none yet)
 uint8_t boostLevel = 100;
 unsigned long boostUntil = 0;
 bool boostOn = false;
@@ -246,9 +273,15 @@ unsigned long lastPotRead = 0;
 uint8_t potWarmup = 0;
 
 // ---------------- Radio ----------------
-char myName[33];
+char myName[33];                      // = the own network's name; also our name in PAIR_INFO
+volatile uint8_t stateFrom = 0;       // paired index of the remote whose state is below
+volatile uint8_t infoDueMask = 0;     // paired remotes owed a LIGHT_INFO
+bool infoChangedHere = false;         // ... and it says "Shooting Max changed on the light"
+unsigned long infoSentAt[MAX_PAIRED];
+bool shootMaxSaveDue = false;
+unsigned long shootMaxSaveAt = 0;
 volatile bool stateNew = false;
-volatile uint8_t stateBase = 0, stateBoost = 0;
+volatile uint8_t stateBase = 0, stateBoost = 0, stateFlags = 0;
 volatile uint16_t stateLeftMs = 0;
 volatile unsigned long stateAtMs = 0;
 
@@ -282,6 +315,11 @@ ESP8266WebServer server(80);
 DNSServer dnsServer;
 IPAddress apIP(AP_IP);
 IPAddress apMask(255, 255, 255, 0);
+String apPassword = "";
+bool passwordApplyPending = false;    // a new password is saved but not yet on the live network
+bool apProtectedNow = false;
+bool apRestartRequested = false;      // new name: restart the network after the answer is out
+bool wifiOffRequested = false;
 bool updateRequested = false;
 enum UpdState { UPD_IDLE, UPD_JOINING, UPD_CHECKING, UPD_INSTALLING, UPD_UPTODATE, UPD_ERROR };
 UpdState updState = UPD_IDLE;
@@ -296,6 +334,52 @@ void stopAP();
 // Helpers
 // =====================================================================
 bool macEquals(const uint8_t* a, const uint8_t* b) { return memcmp(a, b, 6) == 0; }
+
+// ---------------- Radio identity: ESP-NOW goes out on the STATION interface ----------------
+// Same as the remote / LS_ESP8266: the station takes over the chip's original soft-AP MAC (the
+// address remotes paired with), so ESP-NOW keeps working when the own network is switched off.
+// The soft-AP gets a neighbouring address.
+uint8_t factoryStaMac[6];   // the chip's own station MAC: used for the default network name
+uint8_t radioMac[6];        // the address ESP-NOW uses = the chip's original soft-AP MAC
+uint8_t apIfMac[6];         // the soft-AP's address from now on
+bool radioMacsRead = false;
+
+void readRadioMacs() {
+  if (radioMacsRead) return;
+  wifi_get_macaddr(STATION_IF, factoryStaMac);
+  wifi_get_macaddr(SOFTAP_IF, radioMac);
+  bool same = true, zero = true;
+  for (uint8_t i = 0; i < 6; i++) {
+    if (radioMac[i] != factoryStaMac[i]) same = false;
+    if (radioMac[i] != 0) zero = false;
+  }
+  if (same || zero) {
+    memcpy(radioMac, factoryStaMac, 6);
+    radioMac[0] |= 0x02;
+  }
+  memcpy(apIfMac, radioMac, 6);
+  apIfMac[0] = (uint8_t)((apIfMac[0] ^ 0x04) | 0x02);
+  radioMacsRead = true;
+}
+
+bool macIs(uint8_t iface, const uint8_t* want) {
+  uint8_t cur[6];
+  wifi_get_macaddr(iface, cur);
+  return memcmp(cur, want, 6) == 0;
+}
+
+// After every WiFi.mode() change, before softAP().
+void applyRadioIdentity() {
+  readRadioMacs();
+  if ((wifi_get_opmode() & SOFTAP_MODE) && !macIs(SOFTAP_IF, apIfMac)) wifi_set_macaddr(SOFTAP_IF, apIfMac);
+  if (!macIs(STATION_IF, radioMac)) wifi_set_macaddr(STATION_IF, (uint8_t*)radioMac);
+}
+
+void stationStayOffline() {
+  WiFi.setAutoConnect(false);
+  WiFi.setAutoReconnect(false);
+  wifi_station_disconnect();
+}
 
 int findPaired(const uint8_t* mac) {
   for (uint8_t i = 0; i < pairedCount; i++) if (macEquals(pairedMacs[i], mac)) return i;
@@ -346,6 +430,30 @@ void loadPairings() {
   for (uint8_t i = 0; i < MAX_PAIRED; i++) settings.names[i][SENDER_NAME_MAX] = 0;
   memcpy(pairedNames, settings.names, sizeof(pairedNames));
   pairedActive = settings.active;
+  if (settings.shootMax < SHOOT_MAX_MIN) settings.shootMax = SHOOT_MAX_MIN;
+  if (settings.apMagic != AP_MAGIC) {         // older save: default password, automatic name
+    settings.apMagic = AP_MAGIC;
+    settings.apPassSaved = 0;
+    settings.apPass[0] = 0;
+    settings.apSsid[0] = 0;
+    EEPROM.put(0, settings);
+    EEPROM.commit();
+  }
+  settings.apPass[sizeof(settings.apPass) - 1] = 0;
+  settings.apSsid[sizeof(settings.apSsid) - 1] = 0;
+  apPassword = settings.apPassSaved ? String(settings.apPass) : String(DEFAULT_AP_PASSWORD);
+}
+
+void saveSettingsNow() {
+  EEPROM.put(0, settings);
+  EEPROM.commit();
+}
+
+// Own network name: the saved custom name, else "OctocamLight" + last 3 bytes of the factory MAC.
+void buildName() {
+  readRadioMacs();
+  if (settings.apSsid[0]) strlcpy(myName, settings.apSsid, sizeof(myName));
+  else snprintf(myName, sizeof(myName), "OctocamLight%02X%02X%02X", factoryStaMac[3], factoryStaMac[4], factoryStaMac[5]);
 }
 
 void addPeer(uint8_t* mac) {
@@ -415,7 +523,7 @@ void updateOutput() {
   int normalPct = lightOn ? level : 0;
   int pct = normalPct;
   if (boostActive()) {
-    pct = boostLevel < settings.shootMax ? boostLevel : settings.shootMax;
+    pct = settings.shootMax;                 // the remote sets it (0x06 [9]) or the web app does
     wasBoost = true;
     rampFrom = -1;
   } else {
@@ -458,7 +566,11 @@ void onDataRecv(uint8_t* mac, uint8_t* d, uint8_t len) {
     return;
   }
   if (type == PACKET_TYPE_REMOTE_STATE && len >= REMOTE_STATE_LEN) {
-    if (!senderActive(findPaired(mac))) return;      // not paired, or switched off in the app
+    int idx = findPaired(mac);
+    if (!senderActive(idx)) return;                  // not paired, or switched off in the app
+    if (millis() - infoSentAt[idx] >= LIGHT_INFO_EVERY_MS) infoDueMask |= (uint8_t)(1u << idx);
+    stateFrom = (uint8_t)idx;
+    stateFlags = d[7];
     stateBase = d[8] > 100 ? 100 : d[8];
     stateBoost = d[9] > 100 ? 100 : d[9];
     stateLeftMs = ((uint16_t)d[10] << 8) | d[11];
@@ -479,9 +591,54 @@ void applyRemoteState() {
     potControl = false;
     potRef = potF;
   }
+  uint8_t mx = stateBoost;
+  // Only a remote that knows us as a light (flag) sends OUR Shooting Max; older ones send their
+  // general shooting level, which doesn't overwrite the setting here.
+  if ((stateFlags & STATE_FLAG_LIGHT_MAX) && mx >= SHOOT_MAX_MIN && mx != lastRemoteMax) {
+    lastRemoteMax = mx;
+    if (settings.shootMax != mx) {
+      settings.shootMax = mx;
+      shootMaxSaveDue = true;
+      shootMaxSaveAt = millis() + 1000;
+    }
+  }
   boostLevel = stateBoost;
   boostOn = stateLeftMs > 0;
   boostUntil = stateAtMs + stateLeftMs;
+}
+
+// 0x07 LIGHT_INFO to a paired remote: tells it we are a light and our Shooting Max.
+void sendLightInfo(const uint8_t* mac, bool changedHere) {
+  uint8_t p[LIGHT_INFO_LEN] = { PRODUCT_SIGNATURE_0, PRODUCT_SIGNATURE_1, PRODUCT_SIGNATURE_2,
+                                PRODUCT_SIGNATURE_3, PACKET_TYPE_LIGHT_INFO, 0, 0,
+                                settings.shootMax, (uint8_t)(changedHere ? 1 : 0) };
+  esp_now_send((uint8_t*)mac, p, LIGHT_INFO_LEN);
+}
+
+// Shooting Max changed in our own web app: save, and tell the remotes so they take it over.
+void setShootMaxHere(uint8_t v) {
+  if (v < SHOOT_MAX_MIN) v = SHOOT_MAX_MIN;
+  if (v > 100) v = 100;
+  if (v == settings.shootMax) return;
+  settings.shootMax = v;
+  shootMaxSaveDue = true;
+  shootMaxSaveAt = millis() + 1000;
+  infoChangedHere = true;
+  infoDueMask = 0xFF;
+}
+
+void serviceLightInfo() {
+  uint8_t due = infoDueMask;
+  if (due) {
+    infoDueMask = 0;
+    for (uint8_t i = 0; i < pairedCount; i++) {
+      if (!((due >> i) & 1) || !senderActive(i)) continue;
+      sendLightInfo(pairedMacs[i], infoChangedHere);
+      infoSentAt[i] = millis();
+    }
+    infoChangedHere = false;
+  }
+  if (shootMaxSaveDue && (long)(millis() - shootMaxSaveAt) >= 0) { shootMaxSaveDue = false; saveSettingsNow(); }
 }
 
 void sendAck(uint8_t* mac) {
@@ -498,6 +655,8 @@ void sendAck(uint8_t* mac) {
   info[PACKET_LEN] = n;
   memcpy(info + PACKET_LEN + 1, myName, n);
   esp_now_send(mac, info, PACKET_LEN + 1 + n);
+  delay(PAIR_ACK_GAP_MS);
+  sendLightInfo(mac, false);
 }
 
 void showResult(const char* a, const char* b, const char* c) {
@@ -718,7 +877,7 @@ void updateDisplay() {
   u8g2.setFont(u8g2_font_6x10_tr);
   u8g2.drawStr(80, 9, l1);
   u8g2.drawStr(80, 20, l2);
-  if (ipLine) u8g2.setFont(u8g2_font_4x6_tr);   // "192.168.0.1" fits the 48 px column only in 4x6
+  if (ipLine) u8g2.setFont(u8g2_font_4x6_tr);   // small, so any address fits the 48 px column
   u8g2.drawStr(80, 31, l3);
   u8g2.sendBuffer();
 }
@@ -765,15 +924,28 @@ void keepLightRunning() {
 
 void webUsed() { webLastUsed = millis(); }
 
+// Open during the first PASSWORD_GRACE_MS after power-on (forgotten password), then protected
+// if a password (8+) is set.
+bool apShouldBeProtected() { return millis() >= PASSWORD_GRACE_MS && apPassword.length() >= 8; }
+
+void applyAPNow() {
+  bool prot = apShouldBeProtected();
+  WiFi.softAPConfig(apIP, apIP, apMask);
+  WiFi.softAP(myName, prot ? apPassword.c_str() : NULL, WIFI_CHANNEL, 0, AP_MAX_CLIENTS);
+  apProtectedNow = prot;
+  if (millis() >= PASSWORD_GRACE_MS) passwordApplyPending = false;
+}
+
 // The light's own network on channel 11, so ESP-NOW (the remote) keeps working.
 void startAP() {
   WiFi.disconnect();
   WiFi.mode(WIFI_AP_STA);
-  wifi_station_disconnect();
-  WiFi.softAPConfig(apIP, apIP, apMask);
-  WiFi.softAP(myName, AP_PASSWORD, WIFI_CHANNEL, 0, 4);
+  stationStayOffline();
+  applyRadioIdentity();
+  applyAPNow();
   dnsServer.start(53, "*", apIP);
   server.begin();
+  wifi_set_channel(WIFI_CHANNEL);
   wifiMode = WM_AP;
   webUsed();
   lastDrawKey[0] = 0;
@@ -784,10 +956,20 @@ void stopAP() {
   dnsServer.stop();
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
-  wifi_station_disconnect();
+  stationStayOffline();
+  applyRadioIdentity();                      // the station keeps the ESP-NOW address
   wifi_set_channel(WIFI_CHANNEL);
   wifiMode = WM_OFF;
   lastDrawKey[0] = 0;
+}
+
+// End of the grace period / a new password: re-apply, but never kick a phone that is using the app.
+void applyAPConfiguration() {
+  bool prot = apShouldBeProtected();
+  if (!passwordApplyPending && prot == apProtectedNow) return;
+  if (millis() < PASSWORD_GRACE_MS) return;
+  if (WiFi.softAPgetStationNum() > 0) return;
+  applyAPNow();
 }
 
 const char* sourceName() {
@@ -810,6 +992,9 @@ String statusJson() {
   j += ",\"source\":\"" + String(sourceName()) + "\"";
   j += ",\"paired\":" + String(pairedCount);
   j += ",\"shootMax\":" + String(settings.shootMax);
+  j += ",\"apPassSet\":" + String(apPassword.length() >= 8 ? "true" : "false");
+  j += ",\"apProtected\":" + String(apProtectedNow ? "true" : "false");
+  j += ",\"apCustom\":" + String(settings.apSsid[0] ? "true" : "false");
   j += ",\"ssid\":\"" + jsonEsc(settings.wifiSsid) + "\"";
   j += ",\"passSet\":" + String(settings.wifiPass[0] ? "true" : "false");
   j += ",\"ip\":\"" + apIP.toString() + "\"";
@@ -893,14 +1078,32 @@ void handlePair() { webUsed(); openPairingWindow(); server.send(200, "applicatio
 
 void handleSettings() {
   webUsed();
-  if (server.hasArg("shootMax")) {
-    int v = server.arg("shootMax").toInt();
-    settings.shootMax = (uint8_t)constrain(v, 1, 100);
-    EEPROM.put(0, settings);
-    EEPROM.commit();
+  if (server.hasArg("shootMax")) setShootMaxHere((uint8_t)constrain(server.arg("shootMax").toInt(), SHOOT_MAX_MIN, 100));
+  if (server.hasArg("apPass")) {               // own network password: 8+ characters, empty = open
+    String p = server.arg("apPass");
+    if (p.length() == 0 || (p.length() >= 8 && p.length() <= 64)) {
+      apPassword = p;
+      strlcpy(settings.apPass, p.c_str(), sizeof(settings.apPass));
+      settings.apPassSaved = 1;
+      saveSettingsNow();
+      passwordApplyPending = true;             // goes live once nobody is connected
+    }
+  }
+  if (server.hasArg("apSsid")) {               // own network name: empty = automatic name
+    String s = server.arg("apSsid");
+    s.trim();
+    s.replace("\"", "");
+    s.replace("\\", "");
+    if (s.length() > 32) s = s.substring(0, 32);
+    strlcpy(settings.apSsid, s.c_str(), sizeof(settings.apSsid));
+    saveSettingsNow();
+    buildName();
+    apRestartRequested = true;                 // restarts the network after this answer
   }
   server.send(200, "application/json", statusJson());
 }
+
+void handleWifiOff() { webUsed(); server.send(200, "application/json", "{\"ok\":true}"); wifiOffRequested = true; }
 
 void handleUpdate() {
   webUsed();
@@ -967,6 +1170,7 @@ void runUpdate() {
   updRemoteVersion = "";
   updError = "";
   WiFi.mode(WIFI_STA);
+  applyRadioIdentity();
   WiFi.begin(settings.wifiSsid, settings.wifiPass);
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_JOIN_TIMEOUT_MS) { keepLightRunning(); delay(20); }
@@ -999,6 +1203,9 @@ void serviceWifi() {
   if (WiFi.softAPgetStationNum() > 0) webUsed();
   server.handleClient();
   if (updateRequested) { updateRequested = false; runUpdate(); return; }
+  if (wifiOffRequested) { wifiOffRequested = false; delay(200); stopAP(); return; }
+  if (apRestartRequested) { apRestartRequested = false; delay(300); applyAPNow(); }
+  applyAPConfiguration();
   if (!WIFI_ALWAYS_ON && millis() - webLastUsed >= WIFI_IDLE_OFF_MS) stopAP();
 }
 
@@ -1021,21 +1228,19 @@ void setup() {
 
   loadPairings();
 
+  readRadioMacs();                           // before any MAC is changed
+  buildName();
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoConnect(false);
-  WiFi.setAutoReconnect(false);
-  wifi_station_disconnect();
+  stationStayOffline();
+  applyRadioIdentity();
   WiFi.setSleepMode(WIFI_NONE_SLEEP);        // react at once to the remote
   WiFi.setOutputPower(TX_POWER_DBM);
   wifi_set_channel(WIFI_CHANNEL);
-
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  snprintf(myName, sizeof(myName), "OctocamLight%02X%02X%02X", mac[3], mac[4], mac[5]);
+  for (uint8_t i = 0; i < MAX_PAIRED; i++) infoSentAt[i] = (unsigned long)(0 - LIGHT_INFO_EVERY_MS);
 
   if (esp_now_init() == 0) {
-    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+    esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);   // sends on the station: works with the own network off
     esp_now_register_recv_cb(onDataRecv);
     for (uint8_t i = 0; i < pairedCount; i++) addPeer(pairedMacs[i]);
   }
@@ -1058,10 +1263,13 @@ void setup() {
   server.on("/api/sender-forget", HTTP_POST, handleSenderForget);
   server.on("/api/clear-pairings", HTTP_POST, handleClearPairings);
   server.on("/api/pair", HTTP_POST, handlePair);
+  server.on("/api/wifi-off", HTTP_POST, handleWifiOff);
+  server.on("/library/test/success.html", handleRedirect);
   server.onNotFound(handleRedirect);           // captive portal: everything else -> the app
 
   if (WIFI_ALWAYS_ON) startAP();
   if (pairedCount == 0) openPairingWindow(); // nothing paired yet: ready to pair at once
+  infoDueMask = 0xFF;                        // tell the paired remotes we are a light
   updateDisplay();
 }
 
@@ -1072,6 +1280,7 @@ void loop() {
   checkPresetButton();
   readPot();
   processPairing();
+  serviceLightInfo();
   updateOutput();
   serviceWifi();
   updateOutput();

@@ -57,6 +57,25 @@ const char PAGE_HTML[] PROGMEM = R"HTMLPAGE(
     border-radius:10px; background:#8b1e1e; color:var(--fg); cursor:pointer; touch-action:manipulation; }
   .forget-btn:active { background:#a52a2a; }
   .forget-btn.armed { background:#c0392b; }
+
+  /* number field with arrows, as on the other Octocam apps */
+  .duration-row { display:flex; align-items:center; gap:6px; margin-bottom:14px; width:100%; }
+  .duration-label { flex:0 0 auto; width:84px; font-size:0.68rem; font-weight:700; letter-spacing:0.01em;
+    line-height:1.15; background:#5a5a5a; border-radius:8px; min-height:40px; text-align:center;
+    display:flex; align-items:center; justify-content:center; padding:2px 4px; }
+  .field-row { display:flex; align-items:stretch; flex:1 1 auto; min-width:0; gap:5px; }
+  .arrow-btn { flex:0 0 auto; width:32px; background:#333; border:none; border-radius:8px;
+    display:flex; align-items:center; justify-content:center; cursor:pointer; touch-action:manipulation;
+    user-select:none; -webkit-user-select:none; padding:0; }
+  .arrow-btn:active { background:#444; }
+  .arrow-shape { width:0; height:0; border-top:10px solid transparent; border-bottom:10px solid transparent; }
+  .arrow-left .arrow-shape { border-right:13px solid var(--fg); }
+  .arrow-right .arrow-shape { border-left:13px solid var(--fg); }
+  .value-input { flex:1 1 auto; min-width:0; width:auto; text-align:center; font-size:1rem; font-weight:600;
+    background:#2c2c2c; color:var(--fg); border:1px solid #444; border-radius:8px; padding:8px 2px; }
+  .kill-btn { padding:14px 24px; font-size:0.95rem; font-weight:700; border:none; border-radius:10px;
+    background:#8b1e1e; color:var(--fg); cursor:pointer; }
+  .kill-btn.armed { background:#c0392b; }
 </style>
 </head>
 <body>
@@ -72,9 +91,16 @@ const char PAGE_HTML[] PROGMEM = R"HTMLPAGE(
   </div>
   <div class="note" style="margin-top:8px;">The remote keeps working while this network is on.</div>
 
-  <div class="section-label">Shooting Max</div>
-  <input class="field" type="text" inputmode="numeric" id="shootMax" value="">
-  <div class="note" id="shootNote">The shooting light never goes above this, whatever the remote asks for. Saved in the light.</div>
+  <div class="section-label">Shooting Light</div>
+  <div class="duration-row">
+    <div class="duration-label">Shooting Max</div>
+    <div class="field-row">
+      <button class="arrow-btn arrow-left" id="smDown"><span class="arrow-shape"></span></button>
+      <input class="value-input" type="text" id="shootMax" inputmode="numeric">
+      <button class="arrow-btn arrow-right" id="smUp"><span class="arrow-shape"></span></button>
+    </div>
+  </div>
+  <div class="note">the light's level while shooting. The remote can set it too (its row for this light); the last change wins.</div>
 
   <div class="section-label">Paired Devices</div>
   <div class="pairing-block">
@@ -95,6 +121,19 @@ const char PAGE_HTML[] PROGMEM = R"HTMLPAGE(
   <input class="field" type="password" id="pass" maxlength="64" placeholder="password (8+ characters)">
   <button class="btn" id="saveBtn">Save</button>
   <div class="note" id="wifiNote">Used only for Update Firmware. The password is saved only in the light.</div>
+
+  <div class="section-label">This Light's Network</div>
+  <input class="field" type="password" id="apPass" maxlength="64" placeholder="enter a new password">
+  <div class="note">New lights start with the password 88888888 -- change it here. 8+ characters; clearing the field makes the network open. The network is always open for the first 10 s after power-on (use that if the password is forgotten).</div>
+  <div class="note" id="apPassNote"></div>
+  <input class="field" type="text" id="apSsid" maxlength="32" placeholder="leave blank to use the automatic name" autocapitalize="off" autocorrect="off">
+  <button class="btn" id="apSsidBtn">Apply Name</button>
+  <div class="note" id="apSsidNote">Replaces the automatic name with one of your choice. Applying disconnects your phone at once; reconnect to the new name.</div>
+
+  <div style="text-align:center; margin-top:28px;">
+    <button class="kill-btn" id="killBtn">Kill WiFi</button>
+    <div class="note" style="margin-top:8px;">switches this network off (tap twice). The remote keeps working. Hold the light's button D5 for 1-3 s (or switch it off and on) to bring it back.</div>
+  </div>
 </div>
 
 <script>
@@ -106,21 +145,67 @@ const char PAGE_HTML[] PROGMEM = R"HTMLPAGE(
       body:new URLSearchParams(params || {}).toString() });
   }
 
-  // ----- Shooting Max: "100 %" in the field, bare number while typing -----
-  let shootMax = 100;
+  // Arrows: one step at once, held = repeats after 300 ms, speeding up to one step every 50 ms.
+  function attachHold(btn, stepFn) {
+    let holdT = null, repT = null;
+    const rep = tick => { stepFn(); repT = setTimeout(() => rep(tick + 1), Math.max(50, 220 - tick * 15)); };
+    const stop = () => { clearTimeout(holdT); clearTimeout(repT); };
+    btn.addEventListener('pointerdown', () => { stepFn(); clearTimeout(holdT); holdT = setTimeout(() => rep(1), 300); });
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(e => btn.addEventListener(e, stop));
+    btn.addEventListener('contextmenu', e => e.preventDefault());
+  }
+
+  // ----- Shooting Max: "100 %" in the field, bare number while typing; 5 % steps -----
+  let shootMax = 100, smTimer = null, smPending = false;
   const smIn = $('shootMax');
   function showPct() { smIn.value = (document.activeElement === smIn) ? String(shootMax) : (shootMax + ' %'); }
-  smIn.addEventListener('focus', () => { smIn.value = String(shootMax); smIn.select(); });
-  smIn.addEventListener('blur', () => {
-    let v = parseInt(smIn.value, 10);
+  function setShootMax(v) {
     if (isNaN(v)) v = shootMax;
-    v = Math.min(100, Math.max(1, v));
-    const changed = v !== shootMax;
-    shootMax = v;
+    shootMax = Math.min(100, Math.max(5, v));
     showPct();
-    if (changed) post('/api/settings', { shootMax:v }).then(r => r.json()).then(render).catch(() => {});
-  });
+    smPending = true;
+    clearTimeout(smTimer);
+    smTimer = setTimeout(() => {
+      post('/api/settings', { shootMax:shootMax }).then(r => r.json()).then(d => { smPending = false; render(d); }).catch(() => { smPending = false; });
+    }, 300);
+  }
+  smIn.addEventListener('focus', () => { smIn.value = String(shootMax); smIn.select(); });
+  smIn.addEventListener('blur', () => { smIn.value = shootMax + ' %'; });
+  smIn.addEventListener('change', () => setShootMax(parseInt(smIn.value, 10)));
   smIn.addEventListener('keydown', e => { if (e.key === 'Enter') smIn.blur(); });
+  attachHold($('smDown'), () => setShootMax(Math.ceil(shootMax / 5) * 5 - 5));
+  attachHold($('smUp'),   () => setShootMax(Math.floor(shootMax / 5) * 5 + 5));
+
+  // ----- this light's network: password (debounced like the senders) and name -----
+  let apPassTimer = null;
+  $('apPass').addEventListener('input', () => {
+    clearTimeout(apPassTimer);
+    apPassTimer = setTimeout(() => {
+      const p = $('apPass').value;
+      if (p.length > 0 && p.length < 8) { $('apPassNote').textContent = 'At least 8 characters (or empty for an open network).'; return; }
+      post('/api/settings', { apPass:p }).then(r => r.json()).then(render).catch(() => {});
+    }, 600);
+  });
+  $('apSsidBtn').addEventListener('click', () => {
+    $('apSsidNote').textContent = 'Applying... this disconnects you from the network.';
+    post('/api/settings', { apSsid:$('apSsid').value }).then(r => r.json()).then(d => {
+      $('apSsid').value = '';
+      $('apSsidNote').textContent = 'Network renamed to "' + d.name + '". Reconnect to it in your WiFi settings.';
+    }).catch(() => { $('apSsidNote').textContent = 'You were disconnected -- reconnect to the new name in your WiFi settings.'; });
+  });
+  let killArmed = false, killTimer = null;
+  $('killBtn').addEventListener('click', () => {
+    const b = $('killBtn');
+    if (!killArmed) {
+      killArmed = true; b.classList.add('armed'); b.textContent = 'Tap again to switch off';
+      killTimer = setTimeout(() => { killArmed = false; b.classList.remove('armed'); b.textContent = 'Kill WiFi'; }, 5000);
+      return;
+    }
+    clearTimeout(killTimer);
+    post('/api/wifi-off').catch(() => {});
+    b.textContent = 'WiFi off';
+    $('live').textContent = 'WiFi off -- hold D5 for 1-3 s to bring it back';
+  });
 
   function render(d) {
     st = d;
@@ -129,7 +214,10 @@ const char PAGE_HTML[] PROGMEM = R"HTMLPAGE(
     $('fan').textContent = d.fan + ' %';
     $('src').textContent = d.source;
     $('paired').textContent = d.paired;
-    if (document.activeElement !== smIn) { shootMax = d.shootMax; showPct(); }
+    if (document.activeElement !== smIn && !smPending) { shootMax = d.shootMax; showPct(); }
+    $('apSsid').placeholder = d.apCustom ? d.name : 'leave blank to use the automatic name (' + d.name + ')';
+    if (d.apPassSet) $('apPassNote').textContent = d.apProtected ? 'Network is password-protected.' : 'Password saved. The network becomes protected once nobody is connected.';
+    else $('apPassNote').textContent = d.apProtected ? 'Password removed. The network opens once nobody is connected.' : 'Network is open.';
     if (!ssidTouched) $('ssid').value = d.ssid;
     $('pass').placeholder = d.passSet ? 'password saved (type to change)' : 'password (8+ characters)';
     $('verNote').innerHTML = 'Installed: <b>' + d.version + '</b>';
